@@ -41,13 +41,16 @@ import {
 
 /**
  * =========================
- * API CONFIG (Finnhub)
+ * API CONFIG (Finnhub + IndianAPI)
  * =========================
- * Vite:  VITE_FINNHUB_API_KEY in .env
- * Next:  NEXT_PUBLIC_FINNHUB_API_KEY in .env.local
+ * Vite:  VITE_FINNHUB_API_KEY, VITE_INDIANAPI_STOCK_KEY in .env
+ * Next:  NEXT_PUBLIC_FINNHUB_API_KEY (optional legacy)
+ *
+ * IndianAPI base: https://stock.indianapi.in
+ * Auth header: x-api-key: <key>
  */
 const API_CONFIG = {
-  provider: "finnhub",
+  provider: "hybrid",
   finnhubKey:
     (typeof import.meta !== "undefined" &&
       import.meta.env &&
@@ -56,6 +59,12 @@ const API_CONFIG = {
       process.env &&
       process.env.NEXT_PUBLIC_FINNHUB_API_KEY) ||
     "",
+  indianKey:
+    (typeof import.meta !== "undefined" &&
+      import.meta.env &&
+      import.meta.env.VITE_INDIANAPI_STOCK_KEY) ||
+    "",
+  indianBase: "https://stock.indianapi.in",
 };
 
 async function buildHttpError(prefix, res) {
@@ -69,65 +78,190 @@ async function buildHttpError(prefix, res) {
   return `${prefix} (${res.status})${details}`;
 }
 
+/**
+ * =========================
+ * IndianAPI helpers
+ * =========================
+ */
+async function indianFetch(path, params = {}) {
+  if (!API_CONFIG.indianKey) throw new Error("Missing IndianAPI key");
+  const qs = new URLSearchParams(params);
+  const url = `${API_CONFIG.indianBase}${path}?${qs.toString()}`;
+  const res = await fetch(url, { headers: { "x-api-key": API_CONFIG.indianKey } });
+  if (!res.ok) throw new Error(await buildHttpError("IndianAPI failed", res));
+  return await res.json();
+}
+
+function normalizeIndiaTicker(t) {
+  const raw = (t || "").trim().toUpperCase();
+  // Allow RELIANCE.NS / RELIANCE.BO but strip suffix for name lookup
+  return raw.replace(/\.(NS|BO)$/i, "");
+}
+
+// /industry_search?query=... (best for suggestions)
+async function searchStocksIndian(searchText) {
+  const q = (searchText || "").trim();
+  if (!q) return [];
+  if (!API_CONFIG.indianKey) return [];
+
+  const json = await indianFetch("/industry_search", { query: q });
+  const rows = Array.isArray(json) ? json : [];
+
+  // Prefer entries with NSE/BSE codes first
+  const sorted = [...rows].sort((a, b) => {
+    const aHas = !!(a.exchangeCodeNsi || a.exchangeCodeNse || a.exchangeCodeBse);
+    const bHas = !!(b.exchangeCodeNsi || b.exchangeCodeNse || b.exchangeCodeBse);
+    return Number(bHas) - Number(aHas);
+  });
+
+  return sorted.slice(0, 12).map((r) => {
+    const nse = r.exchangeCodeNsi || r.exchangeCodeNse || r.exchangeCodeNSE || r.nseRic || r.nse;
+    const bse = r.exchangeCodeBse || r.exchangeCodeBse || r.exchangeCodeBSE || r.bseRic || r.bse;
+
+    // Prefer NSE if present; fallback to BSE; else attempt commonName
+    const chosen = (nse || bse || r.commonName || "").toString().toUpperCase().trim();
+
+    return {
+      ticker: chosen,
+      name: r.commonName || r.mgIndustry || r.mgSector || "Indian Stock",
+      source: "api",
+      type: r.stockType || "Equity",
+      _india: true,
+      _exchangeHint: nse ? "NSE" : bse ? "BSE" : "",
+    };
+  }).filter((x) => x.ticker);
+}
+
+// /stock?name=... (best for quote by company name)
+async function getQuoteIndian(tickerOrName) {
+  const name = normalizeIndiaTicker(tickerOrName);
+  const d = await indianFetch("/stock", { name });
+
+  const symbol = (d?.tickerId || name || "").toString().toUpperCase();
+  const companyName = d?.companyName || symbol;
+
+  const nse = d?.currentPrice?.NSE;
+  const bse = d?.currentPrice?.BSE;
+
+  const price = Number(nse ?? bse ?? 0) || 0;
+  const changePct = Number(d?.percentChange ?? 0) || 0;
+
+  return {
+    symbol,
+    name: companyName,
+    price,
+    prevClose: 0, // provider may not supply in a stable field
+    changePct,
+    exchange: nse != null ? "NSE" : bse != null ? "BSE" : "",
+    indianApiRaw: d,
+  };
+}
+
+/**
+ * =========================
+ * Hybrid: Finnhub + IndianAPI
+ * =========================
+ */
 async function searchStocksAPI(searchText) {
   const q = (searchText || "").trim();
   if (!q) return [];
-  if (!API_CONFIG.finnhubKey) return [];
 
-  const url = `https://finnhub.io/api/v1/search?q=${encodeURIComponent(
-    q
-  )}&token=${API_CONFIG.finnhubKey}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(await buildHttpError("Search API failed", res));
-  const json = await res.json();
+  const tasks = [];
 
-  return (json.result || [])
-    .filter((r) => r.symbol && r.description)
-    .slice(0, 12)
-    .map((r) => ({
-      ticker: r.symbol,
-      name: r.description,
-      source: "api",
-      type: r.type || "",
-    }));
+  // Finnhub (global)
+  if (API_CONFIG.finnhubKey) {
+    tasks.push(
+      (async () => {
+        const url = `https://finnhub.io/api/v1/search?q=${encodeURIComponent(
+          q
+        )}&token=${API_CONFIG.finnhubKey}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(await buildHttpError("Search API failed", res));
+        const json = await res.json();
+
+        return (json.result || [])
+          .filter((r) => r.symbol && r.description)
+          .slice(0, 12)
+          .map((r) => ({
+            ticker: r.symbol,
+            name: r.description,
+            source: "api",
+            type: r.type || "",
+            _india: false,
+            _exchangeHint: "",
+          }));
+      })()
+    );
+  }
+
+  // IndianAPI (NSE/BSE)
+  if (API_CONFIG.indianKey) tasks.push(searchStocksIndian(q));
+
+  const results = (await Promise.allSettled(tasks))
+    .flatMap((r) => (r.status === "fulfilled" ? r.value : []));
+
+  // De-dupe by ticker (keep first occurrence)
+  const seen = new Set();
+  return results
+    .filter((r) => (seen.has(r.ticker) ? false : (seen.add(r.ticker), true)))
+    .slice(0, 12);
 }
 
 async function getQuoteAPI(ticker) {
   const symbol = (ticker || "").trim().toUpperCase();
   if (!symbol) throw new Error("Ticker missing");
-  if (!API_CONFIG.finnhubKey) throw new Error("Missing API key");
 
-  const quoteUrl = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
-    symbol
-  )}&token=${API_CONFIG.finnhubKey}`;
-  const profileUrl = `https://finnhub.io/api/v1/stock/profile2?symbol=${encodeURIComponent(
-    symbol
-  )}&token=${API_CONFIG.finnhubKey}`;
-
-  const [quoteRes, profileRes] = await Promise.all([
-    fetch(quoteUrl),
-    fetch(profileUrl),
-  ]);
-
-  if (!quoteRes.ok)
-    throw new Error(await buildHttpError("Quote API failed", quoteRes));
-
-  const quote = await quoteRes.json();
-  const profile = profileRes.ok ? await profileRes.json() : {};
-
-  if (quote.c == null || Number.isNaN(Number(quote.c))) {
-    throw new Error("No quote returned for ticker");
+  // If user typed .NS/.BO, go IndianAPI first
+  if (symbol.endsWith(".NS") || symbol.endsWith(".BO")) {
+    if (!API_CONFIG.indianKey) throw new Error("Missing IndianAPI key");
+    return await getQuoteIndian(symbol);
   }
 
-  return {
-    symbol,
-    name: profile.name || symbol,
-    price: Number(quote.c) || 0,
-    prevClose: Number(quote.pc) || 0,
-    changePct: Number(quote.dp) || 0,
-    exchange: profile.exchange || "",
-    finnhubProfile: profile,
-  };
+  // 1) Try Finnhub if available (best for US/global)
+  if (API_CONFIG.finnhubKey) {
+    try {
+      const quoteUrl = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
+        symbol
+      )}&token=${API_CONFIG.finnhubKey}`;
+      const profileUrl = `https://finnhub.io/api/v1/stock/profile2?symbol=${encodeURIComponent(
+        symbol
+      )}&token=${API_CONFIG.finnhubKey}`;
+
+      const [quoteRes, profileRes] = await Promise.all([
+        fetch(quoteUrl),
+        fetch(profileUrl),
+      ]);
+
+      if (!quoteRes.ok)
+        throw new Error(await buildHttpError("Quote API failed", quoteRes));
+
+      const quote = await quoteRes.json();
+      const profile = profileRes.ok ? await profileRes.json() : {};
+
+      if (quote.c == null || Number.isNaN(Number(quote.c))) {
+        throw new Error("No quote returned for ticker");
+      }
+
+      return {
+        symbol,
+        name: profile.name || symbol,
+        price: Number(quote.c) || 0,
+        prevClose: Number(quote.pc) || 0,
+        changePct: Number(quote.dp) || 0,
+        exchange: profile.exchange || "",
+        finnhubProfile: profile,
+      };
+    } catch {
+      // fall through to IndianAPI
+    }
+  }
+
+  // 2) Fallback to IndianAPI
+  if (API_CONFIG.indianKey) {
+    return await getQuoteIndian(symbol);
+  }
+
+  throw new Error("Missing API key");
 }
 
 /**
@@ -467,7 +601,7 @@ function buildDynamicStockProfile(input) {
 
 /**
  * =========================
- * Live quote profile (Finnhub)
+ * Live quote profile (Finnhub / IndianAPI)
  * =========================
  */
 function buildLiveStockProfile(quoteData) {
@@ -566,7 +700,7 @@ export default function StockIntelAgentUI() {
     );
   }, [query]);
 
-  // Live symbol suggestions (Finnhub search)
+  // Live symbol suggestions (Hybrid search)
   useEffect(() => {
     let cancelled = false;
     const q = query.trim();
@@ -591,7 +725,7 @@ export default function StockIntelAgentUI() {
     };
   }, [query]);
 
-  // Live quote for non-local tickers
+  // Live quote for non-local tickers (Hybrid quote)
   useEffect(() => {
     let cancelled = false;
     const q = (query || "").trim().toUpperCase();
@@ -731,7 +865,7 @@ export default function StockIntelAgentUI() {
                           }}
                           className="w-full text-left rounded-xl px-3 py-2 hover:bg-slate-100 transition flex items-center justify-between gap-3"
                         >
-                          <div>
+                          <div className="min-w-0">
                             <p className="text-sm font-semibold text-slate-800">
                               {s.ticker}
                             </p>
@@ -739,8 +873,16 @@ export default function StockIntelAgentUI() {
                               {s.name}
                             </p>
                           </div>
-                          <Badge className="rounded-full bg-emerald-500/10 text-emerald-700 border border-emerald-300/30">
-                            Live
+
+                          {/* Badge: show INDIA vs GLOBAL */}
+                          <Badge
+                            className={`rounded-full border ${
+                              s._india
+                                ? "bg-emerald-500/10 text-emerald-700 border-emerald-300/40"
+                                : "bg-indigo-500/10 text-indigo-700 border-indigo-300/40"
+                            }`}
+                          >
+                            {s._india ? (s._exchangeHint || "INDIA") : "GLOBAL"}
                           </Badge>
                         </button>
                       ))}
@@ -778,9 +920,19 @@ export default function StockIntelAgentUI() {
                         <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50/70 p-3">
                           <p className="text-xs text-slate-600">No matches yet.</p>
                           <p className="text-xs text-slate-500 mt-1">
-                            Type a ticker and click Analyze. Add a Finnhub API key
-                            to enable live search suggestions + quotes.
+                            Type a ticker and click Analyze. Add API keys to enable
+                            live search suggestions + quotes.
                           </p>
+                          {!API_CONFIG.finnhubKey && (
+                            <p className="text-xs text-amber-700 mt-2">
+                              Add VITE_FINNHUB_API_KEY to enable global search/quotes.
+                            </p>
+                          )}
+                          {!API_CONFIG.indianKey && (
+                            <p className="text-xs text-amber-700 mt-1">
+                              Add VITE_INDIANAPI_STOCK_KEY to enable NSE/BSE search/quotes.
+                            </p>
+                          )}
                         </div>
                       ) : null}
                     </div>
@@ -923,10 +1075,9 @@ export default function StockIntelAgentUI() {
                           </p>
                         )}
 
-                        {!API_CONFIG.finnhubKey && (
+                        {!API_CONFIG.finnhubKey && !API_CONFIG.indianKey && (
                           <p className="text-xs text-amber-700 mt-2">
-                            Add VITE_FINNHUB_API_KEY (or NEXT_PUBLIC_FINNHUB_API_KEY)
-                            to enable live API search + quotes.
+                            Add VITE_FINNHUB_API_KEY and/or VITE_INDIANAPI_STOCK_KEY to enable live API search + quotes.
                           </p>
                         )}
 
