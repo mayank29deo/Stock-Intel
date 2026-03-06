@@ -1,4 +1,4 @@
-// src/components/StockIntelAgentUI.jsx
+﻿// src/components/StockIntelAgentUI.jsx
 import React, { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
@@ -41,13 +41,22 @@ import {
 
 /**
  * =========================
- * API CONFIG (Finnhub + IndianAPI)
+ * API CONFIG (Finnhub + Yahoo via Vercel proxy)
  * =========================
- * Vite:  VITE_FINNHUB_API_KEY, VITE_INDIANAPI_STOCK_KEY in .env
- * Next:  NEXT_PUBLIC_FINNHUB_API_KEY (optional legacy)
  *
- * IndianAPI base: https://stock.indianapi.in
- * Auth header: x-api-key: <key>
+ * âœ… Finnhub: optional, direct from browser (US/global)
+ *    Env: VITE_FINNHUB_API_KEY (Vite) or NEXT_PUBLIC_FINNHUB_API_KEY (legacy)
+ *
+ * âœ… Yahoo: no key, MUST be called via proxy routes (fixes CORS)
+ *    Routes:
+ *      GET /api/yahoo/search?q=...
+ *      GET /api/yahoo/quote?symbols=...
+ *
+ * IMPORTANT:
+ * - Create the two proxy files:
+ *   api/yahoo/search.js
+ *   api/yahoo/quote.js
+ * - Run locally using `vercel dev` (not `npm run dev`)
  */
 const API_CONFIG = {
   provider: "hybrid",
@@ -59,12 +68,6 @@ const API_CONFIG = {
       process.env &&
       process.env.NEXT_PUBLIC_FINNHUB_API_KEY) ||
     "",
-  indianKey:
-    (typeof import.meta !== "undefined" &&
-      import.meta.env &&
-      import.meta.env.VITE_INDIANAPI_STOCK_KEY) ||
-    "",
-  indianBase: "https://stock.indianapi.in",
 };
 
 async function buildHttpError(prefix, res) {
@@ -80,86 +83,214 @@ async function buildHttpError(prefix, res) {
 
 /**
  * =========================
- * IndianAPI helpers
+ * Yahoo proxy helpers
  * =========================
  */
-async function indianFetch(path, params = {}) {
-  if (!API_CONFIG.indianKey) throw new Error("Missing IndianAPI key");
+async function yahooProxyFetch(path, params = {}) {
   const qs = new URLSearchParams(params);
-  const url = `${API_CONFIG.indianBase}${path}?${qs.toString()}`;
-  const res = await fetch(url, { headers: { "x-api-key": API_CONFIG.indianKey } });
-  if (!res.ok) throw new Error(await buildHttpError("IndianAPI failed", res));
-  return await res.json();
+  const url = `${path}?${qs.toString()}`;
+  const res = await fetch(url);
+  const contentType = (res.headers.get("content-type") || "").toLowerCase();
+  const raw = await res.text();
+
+  if (!res.ok) {
+    const snippet = raw ? `: ${raw.slice(0, 220)}` : "";
+    throw new Error(`API proxy failed (${res.status})${snippet}`);
+  }
+
+  if (!contentType.includes("application/json")) {
+    const preview = raw.slice(0, 120).replace(/\s+/g, " ").trim();
+    throw new Error(
+      `API proxy returned non-JSON response. Got content-type "${contentType || "unknown"}" with body "${preview}". ` +
+        `If this starts with "<!doctype", you are hitting frontend HTML instead of API route. Run with "vercel dev" or deploy API routes.`
+    );
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const preview = raw.slice(0, 120).replace(/\s+/g, " ").trim();
+    throw new Error(`Yahoo proxy JSON parse failed. Response preview: "${preview}"`);
+  }
 }
 
-function normalizeIndiaTicker(t) {
-  const raw = (t || "").trim().toUpperCase();
-  // Allow RELIANCE.NS / RELIANCE.BO but strip suffix for name lookup
-  return raw.replace(/\.(NS|BO)$/i, "");
+function isIndiaYahooSymbol(sym) {
+  const s = (sym || "").toUpperCase();
+  return s.endsWith(".NS") || s.endsWith(".BO");
 }
 
-// /industry_search?query=... (best for suggestions)
-async function searchStocksIndian(searchText) {
+async function searchStocksYahoo(searchText) {
   const q = (searchText || "").trim();
   if (!q) return [];
-  if (!API_CONFIG.indianKey) return [];
 
-  const json = await indianFetch("/industry_search", { query: q });
-  const rows = Array.isArray(json) ? json : [];
+  const json = await yahooProxyFetch("/api/yahoo/search", { q });
+  const quotes = Array.isArray(json?.quotes) ? json.quotes : [];
 
-  // Prefer entries with NSE/BSE codes first
-  const sorted = [...rows].sort((a, b) => {
-    const aHas = !!(a.exchangeCodeNsi || a.exchangeCodeNse || a.exchangeCodeBse);
-    const bHas = !!(b.exchangeCodeNsi || b.exchangeCodeNse || b.exchangeCodeBse);
-    return Number(bHas) - Number(aHas);
+  // Prefer NSE/BSE (.NS/.BO) results first
+  const sorted = [...quotes].sort((a, b) => {
+    const aIn = isIndiaYahooSymbol(a?.symbol);
+    const bIn = isIndiaYahooSymbol(b?.symbol);
+    return Number(bIn) - Number(aIn);
   });
 
-  return sorted.slice(0, 12).map((r) => {
-    const nse = r.exchangeCodeNsi || r.exchangeCodeNse || r.exchangeCodeNSE || r.nseRic || r.nse;
-    const bse = r.exchangeCodeBse || r.exchangeCodeBse || r.exchangeCodeBSE || r.bseRic || r.bse;
-
-    // Prefer NSE if present; fallback to BSE; else attempt commonName
-    const chosen = (nse || bse || r.commonName || "").toString().toUpperCase().trim();
-
-    return {
-      ticker: chosen,
-      name: r.commonName || r.mgIndustry || r.mgSector || "Indian Stock",
-      source: "api",
-      type: r.stockType || "Equity",
-      _india: true,
-      _exchangeHint: nse ? "NSE" : bse ? "BSE" : "",
-    };
-  }).filter((x) => x.ticker);
+  return sorted
+    .slice(0, 12)
+    .map((r) => {
+      const ticker = (r?.symbol || "").toString().toUpperCase().trim();
+      const india = isIndiaYahooSymbol(ticker);
+      const exch = ticker.endsWith(".NS") ? "NSE" : ticker.endsWith(".BO") ? "BSE" : "GLOBAL";
+      return {
+        ticker,
+        name: r.shortname || r.longname || r.quoteType || "Yahoo Result",
+        source: "api",
+        type: r.quoteType || "",
+        _india: india,
+        _exchangeHint: india ? exch : "GLOBAL",
+        _companyName: r.shortname || r.longname || "",
+      };
+    })
+    .filter((x) => x.ticker);
 }
 
-// /stock?name=... (best for quote by company name)
-async function getQuoteIndian(tickerOrName) {
-  const name = normalizeIndiaTicker(tickerOrName);
-  const d = await indianFetch("/stock", { name });
+async function getQuoteYahoo(ticker) {
+  const symbol = (ticker || "").trim().toUpperCase();
+  if (!symbol) throw new Error("Ticker missing");
 
-  const symbol = (d?.tickerId || name || "").toString().toUpperCase();
-  const companyName = d?.companyName || symbol;
+  const json = await yahooProxyFetch("/api/yahoo/quote", { symbols: symbol });
+  const item = json?.quoteResponse?.result?.[0];
+  if (!item) throw new Error("No Yahoo quote returned");
 
-  const nse = d?.currentPrice?.NSE;
-  const bse = d?.currentPrice?.BSE;
-
-  const price = Number(nse ?? bse ?? 0) || 0;
-  const changePct = Number(d?.percentChange ?? 0) || 0;
+  const price = Number(item.regularMarketPrice ?? 0) || 0;
+  const changePct = Number(item.regularMarketChangePercent ?? 0) || 0;
 
   return {
     symbol,
-    name: companyName,
+    name: item.longName || item.shortName || symbol,
     price,
-    prevClose: 0, // provider may not supply in a stable field
+    prevClose: Number(item.regularMarketPreviousClose ?? 0) || 0,
     changePct,
-    exchange: nse != null ? "NSE" : bse != null ? "BSE" : "",
-    indianApiRaw: d,
+    exchange: item.fullExchangeName || item.exchange || "",
+    yahooRaw: item,
+  };
+}
+
+function mapIndianSymbolForAlpha(ticker) {
+  const symbol = (ticker || "").trim().toUpperCase();
+  if (symbol.endsWith(".NS")) return `${symbol.slice(0, -3)}.NSE`;
+  if (symbol.endsWith(".BO")) return `${symbol.slice(0, -3)}.BSE`;
+  return symbol;
+}
+
+async function getQuoteAlphaVantage(ticker) {
+  const symbol = (ticker || "").trim().toUpperCase();
+  if (!symbol) throw new Error("Ticker missing");
+
+  const alphaSymbol = mapIndianSymbolForAlpha(symbol);
+  const json = await yahooProxyFetch("/api/alpha/quote", { symbol: alphaSymbol });
+
+  if (json?.Note) {
+    throw new Error(`Alpha Vantage limit: ${json.Note}`);
+  }
+  if (json?.Information) {
+    throw new Error(`Alpha Vantage info: ${json.Information}`);
+  }
+  if (json?.ErrorMessage) {
+    throw new Error(`Alpha Vantage error: ${json.ErrorMessage}`);
+  }
+
+  const q = json?.["Global Quote"] || {};
+  const price = Number(q["05. price"] || 0);
+  const prevClose = Number(q["08. previous close"] || 0);
+  const changePctText = (q["10. change percent"] || "").toString().replace("%", "");
+  const changePct = Number(changePctText || 0);
+
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error(`No Alpha Vantage quote returned for ${alphaSymbol}`);
+  }
+
+  return {
+    symbol,
+    name: symbol,
+    price,
+    prevClose: Number.isFinite(prevClose) ? prevClose : 0,
+    changePct: Number.isFinite(changePct) ? changePct : 0,
+    exchange: symbol.endsWith(".NS") ? "NSE" : symbol.endsWith(".BO") ? "BSE" : "",
+    alphaRaw: json,
   };
 }
 
 /**
  * =========================
- * Hybrid: Finnhub + IndianAPI
+ * Finnhub helpers (as before)
+ * =========================
+ */
+async function searchStocksFinnhub(searchText) {
+  const q = (searchText || "").trim();
+  if (!q) return [];
+  if (!API_CONFIG.finnhubKey) return [];
+
+  const url = `https://finnhub.io/api/v1/search?q=${encodeURIComponent(
+    q
+  )}&token=${API_CONFIG.finnhubKey}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(await buildHttpError("Search API failed", res));
+  const json = await res.json();
+
+  return (json.result || [])
+    .filter((r) => r.symbol && r.description)
+    .slice(0, 12)
+    .map((r) => ({
+      ticker: r.symbol,
+      name: r.description,
+      source: "api",
+      type: r.type || "",
+      _india: false,
+      _exchangeHint: "",
+      _companyName: "",
+    }));
+}
+
+async function getQuoteFinnhub(ticker) {
+  const symbol = (ticker || "").trim().toUpperCase();
+  if (!symbol) throw new Error("Ticker missing");
+  if (!API_CONFIG.finnhubKey) throw new Error("Missing API key");
+
+  const quoteUrl = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
+    symbol
+  )}&token=${API_CONFIG.finnhubKey}`;
+  const profileUrl = `https://finnhub.io/api/v1/stock/profile2?symbol=${encodeURIComponent(
+    symbol
+  )}&token=${API_CONFIG.finnhubKey}`;
+
+  const [quoteRes, profileRes] = await Promise.all([
+    fetch(quoteUrl),
+    fetch(profileUrl),
+  ]);
+
+  if (!quoteRes.ok)
+    throw new Error(await buildHttpError("Quote API failed", quoteRes));
+
+  const quote = await quoteRes.json();
+  const profile = profileRes.ok ? await profileRes.json() : {};
+
+  if (quote.c == null || Number.isNaN(Number(quote.c))) {
+    throw new Error("No quote returned for ticker");
+  }
+
+  return {
+    symbol,
+    name: profile.name || symbol,
+    price: Number(quote.c) || 0,
+    prevClose: Number(quote.pc) || 0,
+    changePct: Number(quote.dp) || 0,
+    exchange: profile.exchange || "",
+    finnhubProfile: profile,
+  };
+}
+
+/**
+ * =========================
+ * Hybrid API surface (used by UI)
  * =========================
  */
 async function searchStocksAPI(searchText) {
@@ -167,101 +298,71 @@ async function searchStocksAPI(searchText) {
   if (!q) return [];
 
   const tasks = [];
+  if (API_CONFIG.finnhubKey) tasks.push(searchStocksFinnhub(q)); // optional global
+  tasks.push(searchStocksYahoo(q)); // Yahoo covers India (.NS/.BO) well
 
-  // Finnhub (global)
-  if (API_CONFIG.finnhubKey) {
-    tasks.push(
-      (async () => {
-        const url = `https://finnhub.io/api/v1/search?q=${encodeURIComponent(
-          q
-        )}&token=${API_CONFIG.finnhubKey}`;
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(await buildHttpError("Search API failed", res));
-        const json = await res.json();
+  const results = (await Promise.allSettled(tasks)).flatMap((r) =>
+    r.status === "fulfilled" ? r.value : []
+  );
 
-        return (json.result || [])
-          .filter((r) => r.symbol && r.description)
-          .slice(0, 12)
-          .map((r) => ({
-            ticker: r.symbol,
-            name: r.description,
-            source: "api",
-            type: r.type || "",
-            _india: false,
-            _exchangeHint: "",
-          }));
-      })()
-    );
-  }
-
-  // IndianAPI (NSE/BSE)
-  if (API_CONFIG.indianKey) tasks.push(searchStocksIndian(q));
-
-  const results = (await Promise.allSettled(tasks))
-    .flatMap((r) => (r.status === "fulfilled" ? r.value : []));
-
-  // De-dupe by ticker (keep first occurrence)
   const seen = new Set();
   return results
     .filter((r) => (seen.has(r.ticker) ? false : (seen.add(r.ticker), true)))
     .slice(0, 12);
 }
 
-async function getQuoteAPI(ticker) {
+// Keep signature (ticker, maybeCompanyName) to avoid touching the rest of the file
+async function getQuoteAPI(ticker /*, maybeCompanyName */) {
   const symbol = (ticker || "").trim().toUpperCase();
   if (!symbol) throw new Error("Ticker missing");
 
-  // If user typed .NS/.BO, go IndianAPI first
-  if (symbol.endsWith(".NS") || symbol.endsWith(".BO")) {
-    if (!API_CONFIG.indianKey) throw new Error("Missing IndianAPI key");
-    return await getQuoteIndian(symbol);
-  }
+  const isIndia = symbol.endsWith(".NS") || symbol.endsWith(".BO");
+  const hasFinnhub = Boolean(API_CONFIG.finnhubKey);
 
-  // 1) Try Finnhub if available (best for US/global)
-  if (API_CONFIG.finnhubKey) {
+  // India symbols prefer Yahoo first.
+  if (isIndia) {
     try {
-      const quoteUrl = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
-        symbol
-      )}&token=${API_CONFIG.finnhubKey}`;
-      const profileUrl = `https://finnhub.io/api/v1/stock/profile2?symbol=${encodeURIComponent(
-        symbol
-      )}&token=${API_CONFIG.finnhubKey}`;
-
-      const [quoteRes, profileRes] = await Promise.all([
-        fetch(quoteUrl),
-        fetch(profileUrl),
-      ]);
-
-      if (!quoteRes.ok)
-        throw new Error(await buildHttpError("Quote API failed", quoteRes));
-
-      const quote = await quoteRes.json();
-      const profile = profileRes.ok ? await profileRes.json() : {};
-
-      if (quote.c == null || Number.isNaN(Number(quote.c))) {
-        throw new Error("No quote returned for ticker");
+      return await getQuoteYahoo(symbol);
+    } catch (yahooErr) {
+      try {
+        return await getQuoteAlphaVantage(symbol);
+      } catch (alphaErr) {
+        // Continue to Finnhub fallback if configured.
       }
-
-      return {
-        symbol,
-        name: profile.name || symbol,
-        price: Number(quote.c) || 0,
-        prevClose: Number(quote.pc) || 0,
-        changePct: Number(quote.dp) || 0,
-        exchange: profile.exchange || "",
-        finnhubProfile: profile,
-      };
-    } catch {
-      // fall through to IndianAPI
+      if (hasFinnhub) {
+        try {
+          return await getQuoteFinnhub(symbol);
+        } catch {
+          // Keep original Yahoo error below for clearer provider context.
+        }
+      }
+      throw new Error(
+        `Yahoo quote unavailable for ${symbol}. ${
+          yahooErr?.message || "Provider returned unauthorized/error response."
+        }`
+      );
     }
   }
 
-  // 2) Fallback to IndianAPI
-  if (API_CONFIG.indianKey) {
-    return await getQuoteIndian(symbol);
+  // US/global: Finnhub first if key exists.
+  if (hasFinnhub) {
+    try {
+      return await getQuoteFinnhub(symbol);
+    } catch (finnhubErr) {
+      try {
+        return await getQuoteYahoo(symbol);
+      } catch (yahooErr) {
+        throw new Error(
+          `Both quote providers failed for ${symbol}. Finnhub: ${
+            finnhubErr?.message || "error"
+          } | Yahoo: ${yahooErr?.message || "error"}`
+        );
+      }
+    }
   }
 
-  throw new Error("Missing API key");
+  // No Finnhub key configured: Yahoo only.
+  return await getQuoteYahoo(symbol);
 }
 
 /**
@@ -376,7 +477,7 @@ const STOCKS = [
     catalysts: [
       { label: "Large Deal Wins", impact: "High", eta: "Rolling" },
       { label: "Quarterly Margin Commentary", impact: "High", eta: "28d" },
-      { label: "Global IT Spend Signals", impact: "Medium", eta: "2–6w" },
+      { label: "Global IT Spend Signals", impact: "Medium", eta: "2â€“6w" },
     ],
     headlines: [
       "IT services outlook tied to client discretionary revival timelines",
@@ -601,7 +702,7 @@ function buildDynamicStockProfile(input) {
 
 /**
  * =========================
- * Live quote profile (Finnhub / IndianAPI)
+ * Live quote profile (Finnhub / Yahoo proxy)
  * =========================
  */
 function buildLiveStockProfile(quoteData) {
@@ -611,17 +712,13 @@ function buildLiveStockProfile(quoteData) {
     ...base,
     ticker,
     name: quoteData.name || base.name,
-    price: Number(
-      quoteData.price?.toFixed?.(2) ?? quoteData.price ?? base.price
-    ),
-    chg: Number(
-      quoteData.changePct?.toFixed?.(2) ?? quoteData.changePct ?? base.chg
-    ),
+    price: Number(quoteData.price?.toFixed?.(2) ?? quoteData.price ?? base.price),
+    chg: Number(quoteData.changePct?.toFixed?.(2) ?? quoteData.changePct ?? base.chg),
     thesis: `Live market quote connected for ${ticker}. Price and daily move are real-time/near real-time (provider dependent). Multi-factor intelligence blocks remain mock-scored until news/sentiment/insider/compliance sources are connected.`,
     headlines: [
-      `${ticker}: Live quote connected ✅`,
-      `${ticker}: Next step → wire news + sentiment APIs`,
-      `${ticker}: Next step → insider, filings, and institutional data feeds`,
+      `${ticker}: Live quote connected âœ…`,
+      `${ticker}: Next step â†’ wire news + sentiment APIs`,
+      `${ticker}: Next step â†’ insider, filings, and institutional data feeds`,
     ],
     _mode: "live-quote",
     _exchange: quoteData.exchange || "",
@@ -688,6 +785,9 @@ export default function StockIntelAgentUI() {
   const [apiLoading, setApiLoading] = useState(false);
   const [apiError, setApiError] = useState("");
 
+  // keep this state to avoid changing rest of the UI logic
+  const [lastPickedSuggestion, setLastPickedSuggestion] = useState(null);
+
   const [timeframe, setTimeframe] = useState("30d");
   const [riskMode, setRiskMode] = useState("balanced");
   const [watchlist, setWatchlist] = useState(["NVDA", "TCS"]);
@@ -696,11 +796,12 @@ export default function StockIntelAgentUI() {
     const q = query.trim().toLowerCase();
     if (!q) return STOCKS;
     return STOCKS.filter(
-      (s) => s.ticker.toLowerCase().includes(q) || s.name.toLowerCase().includes(q)
+      (s) =>
+        s.ticker.toLowerCase().includes(q) || s.name.toLowerCase().includes(q)
     );
   }, [query]);
 
-  // Live symbol suggestions (Hybrid search)
+  // Live symbol suggestions (hybrid)
   useEffect(() => {
     let cancelled = false;
     const q = query.trim();
@@ -725,7 +826,7 @@ export default function StockIntelAgentUI() {
     };
   }, [query]);
 
-  // Live quote for non-local tickers (Hybrid quote)
+  // Live quote for non-local tickers (hybrid)
   useEffect(() => {
     let cancelled = false;
     const q = (query || "").trim().toUpperCase();
@@ -741,8 +842,17 @@ export default function StockIntelAgentUI() {
 
       setApiLoading(true);
       setApiError("");
+
+      // Keep the shape but Yahoo quote doesn't need companyName; it's safe to pass empty.
+      const companyName =
+        lastPickedSuggestion &&
+        lastPickedSuggestion.ticker &&
+        lastPickedSuggestion.ticker.toUpperCase() === q
+          ? lastPickedSuggestion._companyName || ""
+          : "";
+
       try {
-        const quote = await getQuoteAPI(q);
+        const quote = await getQuoteAPI(q, companyName);
         if (!cancelled) setLiveProfile(buildLiveStockProfile(quote));
       } catch (e) {
         if (!cancelled) {
@@ -758,26 +868,30 @@ export default function StockIntelAgentUI() {
     return () => {
       cancelled = true;
     };
-  }, [query]);
+  }, [query, lastPickedSuggestion]);
 
   const current = useMemo(() => {
     const q = query.trim();
     const qUpper = q.toUpperCase();
     const selectedMatch = STOCKS.find((s) => s.ticker === selected);
     const exactTickerMatch = STOCKS.find((s) => s.ticker === qUpper);
-    const exactNameMatch = STOCKS.find((s) => s.name.toLowerCase() === q.toLowerCase());
+    const exactNameMatch = STOCKS.find(
+      (s) => s.name.toLowerCase() === q.toLowerCase()
+    );
 
     if (exactTickerMatch) return exactTickerMatch;
     if (exactNameMatch) return exactNameMatch;
     if (liveProfile && liveProfile.ticker === qUpper) return liveProfile;
-    if (selectedMatch && (!q || qUpper === selectedMatch.ticker)) return selectedMatch;
+    if (selectedMatch && (!q || qUpper === selectedMatch.ticker))
+      return selectedMatch;
 
     if (q) return buildDynamicStockProfile(q);
     return selectedMatch || STOCKS[0];
   }, [query, selected, liveProfile]);
 
   const adjustedReco = useMemo(() => {
-    const modifier = riskMode === "aggressive" ? 6 : riskMode === "conservative" ? -6 : 0;
+    const modifier =
+      riskMode === "aggressive" ? 6 : riskMode === "conservative" ? -6 : 0;
     return recommendationEngine({
       ...current.scores,
       technicals: clamp(current.scores.technicals + modifier),
@@ -806,12 +920,12 @@ export default function StockIntelAgentUI() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-100 via-zinc-50 to-stone-100 text-slate-900 p-4 md:p-6">
-      <div className="max-w-7xl mx-auto space-y-5">
+      <div className="max-w-7xl mx-auto space-y-5 relative overflow-visible">
         {/* Header */}
         <motion.div
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
-          className="rounded-3xl border border-white/70 bg-white/70 backdrop-blur-xl shadow-lg p-4 md:p-5"
+          className="relative z-50 overflow-visible rounded-3xl border border-white/70 bg-white/70 backdrop-blur-xl shadow-lg p-4 md:p-5"
         >
           <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
@@ -828,13 +942,13 @@ export default function StockIntelAgentUI() {
               </h1>
               <p className="text-sm text-slate-600 mt-1 max-w-3xl">
                 Geo-political signals, public sentiment, insiders, trade/tariffs,
-                compliance, institutional flow, and technical context — merged
+                compliance, institutional flow, and technical context â€” merged
                 into one crisp action band.
               </p>
             </div>
 
             <div className="flex flex-col sm:flex-row gap-2 w-full lg:w-auto">
-              <div className="relative w-full sm:w-80">
+              <div className="relative z-[60] w-full sm:w-80">
                 <Search className="h-4 w-4 text-slate-500 absolute left-3 top-3" />
                 <Input
                   value={query}
@@ -848,7 +962,7 @@ export default function StockIntelAgentUI() {
                 />
 
                 {searchOpen && (
-                  <div className="absolute z-30 mt-2 w-full rounded-2xl border border-white/80 bg-white/95 backdrop-blur shadow-xl overflow-hidden">
+                  <div className="absolute left-0 top-full z-[70] mt-2 w-full rounded-2xl border border-white/80 bg-white/95 backdrop-blur shadow-xl overflow-hidden">
                     <div className="max-h-72 overflow-auto p-2 space-y-1">
                       {!!remoteSuggestions.length && (
                         <div className="px-2 pt-1 pb-1 text-[11px] uppercase tracking-wide text-slate-500">
@@ -862,6 +976,7 @@ export default function StockIntelAgentUI() {
                             setSelected(s.ticker);
                             setQuery(s.ticker);
                             setSearchOpen(false);
+                            setLastPickedSuggestion(s);
                           }}
                           className="w-full text-left rounded-xl px-3 py-2 hover:bg-slate-100 transition flex items-center justify-between gap-3"
                         >
@@ -874,7 +989,6 @@ export default function StockIntelAgentUI() {
                             </p>
                           </div>
 
-                          {/* Badge: show INDIA vs GLOBAL */}
                           <Badge
                             className={`rounded-full border ${
                               s._india
@@ -900,6 +1014,7 @@ export default function StockIntelAgentUI() {
                               setSelected(s.ticker);
                               setQuery(s.ticker);
                               setSearchOpen(false);
+                              setLastPickedSuggestion(null);
                             }}
                             className="w-full text-left rounded-xl px-3 py-2 hover:bg-slate-100 transition flex items-center justify-between gap-3"
                           >
@@ -920,17 +1035,12 @@ export default function StockIntelAgentUI() {
                         <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50/70 p-3">
                           <p className="text-xs text-slate-600">No matches yet.</p>
                           <p className="text-xs text-slate-500 mt-1">
-                            Type a ticker and click Analyze. Add API keys to enable
-                            live search suggestions + quotes.
+                            Type a ticker and click Analyze. Yahoo live runs via
+                            /api/yahoo/* (Vercel dev / deploy).
                           </p>
                           {!API_CONFIG.finnhubKey && (
-                            <p className="text-xs text-amber-700 mt-2">
-                              Add VITE_FINNHUB_API_KEY to enable global search/quotes.
-                            </p>
-                          )}
-                          {!API_CONFIG.indianKey && (
-                            <p className="text-xs text-amber-700 mt-1">
-                              Add VITE_INDIANAPI_STOCK_KEY to enable NSE/BSE search/quotes.
+                            <p className="text-xs text-slate-500 mt-2">
+                              Finnhub key not set (optional). Yahoo will still work.
                             </p>
                           )}
                         </div>
@@ -945,6 +1055,7 @@ export default function StockIntelAgentUI() {
                 onValueChange={(v) => {
                   setSelected(v);
                   setQuery(v);
+                  setLastPickedSuggestion(null);
                 }}
               >
                 <SelectTrigger className="w-full sm:w-44 rounded-2xl bg-white/80 border-white shadow-sm">
@@ -953,7 +1064,7 @@ export default function StockIntelAgentUI() {
                 <SelectContent>
                   {STOCKS.map((s) => (
                     <SelectItem key={s.ticker} value={s.ticker}>
-                      {s.ticker} · {s.name}
+                      {s.ticker} Â· {s.name}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -966,6 +1077,7 @@ export default function StockIntelAgentUI() {
                   if (!q) return;
                   setSelected(q.toUpperCase());
                   setSearchOpen(false);
+                  setLastPickedSuggestion(null);
                 }}
               >
                 Analyze <ChevronRight className="ml-1 h-4 w-4" />
@@ -975,7 +1087,7 @@ export default function StockIntelAgentUI() {
         </motion.div>
 
         {/* Hero band */}
-        <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+        <div className="relative z-10 grid grid-cols-1 xl:grid-cols-3 gap-5">
           <motion.div
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
@@ -1001,7 +1113,7 @@ export default function StockIntelAgentUI() {
                       <h2 className="text-2xl md:text-3xl font-semibold tracking-tight">
                         {current.ticker}{" "}
                         <span className="text-slate-500 font-medium">
-                          · {current.name}
+                          Â· {current.name}
                         </span>
                       </h2>
                       <div className="flex items-center gap-3 mt-2">
@@ -1071,13 +1183,7 @@ export default function StockIntelAgentUI() {
 
                         {apiLoading && (
                           <p className="text-xs text-slate-500 mt-2">
-                            Fetching live quote…
-                          </p>
-                        )}
-
-                        {!API_CONFIG.finnhubKey && !API_CONFIG.indianKey && (
-                          <p className="text-xs text-amber-700 mt-2">
-                            Add VITE_FINNHUB_API_KEY and/or VITE_INDIANAPI_STOCK_KEY to enable live API search + quotes.
+                            Fetching live quoteâ€¦
                           </p>
                         )}
 
@@ -1534,7 +1640,9 @@ export default function StockIntelAgentUI() {
                         </div>
                         <div className="text-right">
                           <p className="text-sm font-semibold">{r.action}</p>
-                          <p className="text-xs text-slate-500">{r.conviction}/100</p>
+                          <p className="text-xs text-slate-500">
+                            {r.conviction}/100
+                          </p>
                         </div>
                       </div>
                       <Progress value={r.conviction} className="mt-3 h-2 bg-slate-200" />
