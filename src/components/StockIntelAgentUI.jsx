@@ -574,30 +574,21 @@ function recommendationEngine(scores) {
   let note =
     "Risk-reward is balanced right now. Track catalysts and wait for a cleaner edge.";
 
-  if (conviction >= 78) {
+  if (conviction > 70) {
     action = "Buy";
     band = "High Conviction";
     note =
       "Multi-factor setup is strong. Consider accumulating with risk controls around near-term catalysts.";
-  } else if (conviction >= 65) {
-    action = "Keep / Add on Dips";
-    band = "Constructive";
-    note =
-      "Structure remains healthy, but entries are better when sentiment cools or price retraces.";
-  } else if (conviction >= 52) {
+  } else if (conviction >= 65 && conviction <= 70) {
     action = "Hold";
-    band = "Balanced";
+    band = "Neutral";
     note =
-      "Signals are mixed. Let the next catalyst or trend confirmation improve clarity.";
-  } else if (conviction >= 40) {
-    action = "Reduce / Watch Closely";
-    band = "Fragile";
-    note =
-      "Downside risks are increasing. Tighten stop-loss / allocation and monitor headline risk.";
+      "Conviction is in the hold zone. Wait for stronger confirmation before switching bias.";
   } else {
-    action = "Sell / Exit";
+    action = "Sell";
     band = "Risk-Off";
-    note = "Broad signal weakness and elevated risk suggest capital protection first.";
+    note =
+      "Conviction is below buy/hold threshold. Favor capital protection and defensive positioning.";
   }
 
   return { conviction, action, band, note };
@@ -789,8 +780,12 @@ export default function StockIntelAgentUI() {
   const [lastPickedSuggestion, setLastPickedSuggestion] = useState(null);
 
   const [timeframe, setTimeframe] = useState("30d");
-  const [riskMode, setRiskMode] = useState("balanced");
+  const [riskMode, setRiskMode] = useState("moderate");
   const [watchlist, setWatchlist] = useState(["NVDA", "TCS"]);
+  const [activeAgentQuestion, setActiveAgentQuestion] = useState("");
+  const [agentResponse, setAgentResponse] = useState("");
+  const [agentBusy, setAgentBusy] = useState(false);
+  const [agentError, setAgentError] = useState("");
 
   const filteredStocks = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -891,7 +886,7 @@ export default function StockIntelAgentUI() {
 
   const adjustedReco = useMemo(() => {
     const modifier =
-      riskMode === "aggressive" ? 6 : riskMode === "conservative" ? -6 : 0;
+      riskMode === "aggressive" ? 5 : riskMode === "conservative" ? -5 : 0;
     return recommendationEngine({
       ...current.scores,
       technicals: clamp(current.scores.technicals + modifier),
@@ -916,6 +911,86 @@ export default function StockIntelAgentUI() {
         ? prev.filter((t) => t !== current.ticker)
         : [...prev, current.ticker]
     );
+  };
+
+  const agentQuestions = [
+    "What can go wrong for this stock in the next 30 days?",
+    "Summarize the insider + institutional signal conflict",
+    "How much of the thesis depends on policy risk?",
+    "Give me a buy-on-dips plan with 3 trigger zones",
+    "What news would flip this from Hold to Buy?",
+    "Compare this with a safer stock in the same theme",
+  ];
+
+  const handleAgentQuestionClick = (question) => {
+    const reco = recommendationEngine(current.scores);
+    const riskSide = reco.action;
+    const basePrice = Number(current.price || 0);
+    const one = basePrice ? (basePrice * 0.01).toFixed(2) : "0.00";
+    const two = basePrice ? (basePrice * 0.02).toFixed(2) : "0.00";
+    const three = basePrice ? (basePrice * 0.03).toFixed(2) : "0.00";
+    const support1 = basePrice ? (basePrice * 0.985).toFixed(2) : "N/A";
+    const support2 = basePrice ? (basePrice * 0.97).toFixed(2) : "N/A";
+    const support3 = basePrice ? (basePrice * 0.955).toFixed(2) : "N/A";
+    const safer = [...STOCKS]
+      .filter((s) => s.ticker !== current.ticker)
+      .sort((a, b) => {
+        const av = Math.abs(a.chg) + (100 - recommendationEngine(a.scores).conviction) * 0.02;
+        const bv = Math.abs(b.chg) + (100 - recommendationEngine(b.scores).conviction) * 0.02;
+        return av - bv;
+      })[0];
+
+    setActiveAgentQuestion(question);
+    setAgentError("");
+    setSearchOpen(false);
+    setLastPickedSuggestion(null);
+    setAgentBusy(true);
+
+    (async () => {
+      try {
+        let live = null;
+        try {
+          live = await getQuoteAPI(current.ticker);
+        } catch {
+          live = null;
+        }
+
+        const liveTag = live
+          ? `Live quote: ${live.symbol} ${Number(live.price || 0).toFixed(2)} (${Number(
+              live.changePct || 0
+            ).toFixed(2)}%).`
+          : "Live quote unavailable right now; using latest model snapshot.";
+
+        let mapped = "";
+        if (question === "What can go wrong for this stock in the next 30 days?") {
+          mapped = `${liveTag} Top downside risks: policy/geo score ${current.scores.geopolitics}/100, tariff/trade score ${current.scores.tariffs}/100, and sentiment crowding score ${current.scores.sentiment}/100. Current stance is ${riskSide}; if conviction drops below 65, switch to strict risk-off sizing.`;
+        } else if (question === "Summarize the insider + institutional signal conflict") {
+          mapped = `${liveTag} Insider signal is ${current.scores.insider}/100 while institutional positioning is ${current.scores.institutions}/100. If institutions stay high but insider score falls, treat it as distribution risk and avoid chasing breakout candles.`;
+        } else if (question === "How much of the thesis depends on policy risk?") {
+          mapped = `${liveTag} Policy dependency is material because geo score is ${current.scores.geopolitics}/100 and trade score is ${current.scores.tariffs}/100. Treat policy headlines as high-priority invalidation triggers for the thesis.`;
+        } else if (question === "Give me a buy-on-dips plan with 3 trigger zones") {
+          mapped = `${liveTag} Dip plan for ${current.ticker}: Zone-1 near ${support1} (risk ${one}), Zone-2 near ${support2} (risk ${two}), Zone-3 near ${support3} (risk ${three}). Add only if conviction remains >= 65 and momentum does not break structurally.`;
+        } else if (question === "What news would flip this from Hold to Buy?") {
+          mapped = `${liveTag} A flip to Buy needs conviction > 70. Most useful triggers: positive guidance/earnings surprise, stronger institutional accumulation, and improving sentiment breadth with follow-through volume.`;
+        } else if (question === "Compare this with a safer stock in the same theme") {
+          if (safer) {
+            const saferReco = recommendationEngine(safer.scores);
+            mapped = `${liveTag} Safer alternative in this set: ${safer.ticker} (${safer.name}), conviction ${saferReco.conviction}/100 with action ${saferReco.action}. Compare drawdown behavior and keep position size larger only on the lower-volatility candidate.`;
+          } else {
+            mapped = `${liveTag} No safer peer found in current sample set.`;
+          }
+        } else {
+          mapped = `${liveTag} Analysis mapped for ${current.ticker}.`;
+        }
+
+        setAgentResponse(mapped);
+      } catch (e) {
+        setAgentError(e?.message || "Unable to generate mapped response");
+        setAgentResponse("");
+      } finally {
+        setAgentBusy(false);
+      }
+    })();
   };
 
   return (
@@ -1244,7 +1319,7 @@ export default function StockIntelAgentUI() {
                   <div className="grid grid-cols-3 gap-2">
                     {[
                       ["conservative", "Conservative"],
-                      ["balanced", "Balanced"],
+                      ["moderate", "Moderate"],
                       ["aggressive", "Aggressive"],
                     ].map(([key, label]) => (
                       <button
@@ -1587,17 +1662,17 @@ export default function StockIntelAgentUI() {
               </CardHeader>
               <CardContent>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  {[
-                    "What can go wrong for this stock in the next 30 days?",
-                    "Summarize the insider + institutional signal conflict",
-                    "How much of the thesis depends on policy risk?",
-                    "Give me a buy-on-dips plan with 3 trigger zones",
-                    "What news would flip this from Hold to Buy?",
-                    "Compare this with a safer stock in the same theme",
-                  ].map((q, idx) => (
+                  {agentQuestions.map((q, idx) => (
                     <button
                       key={idx}
-                      className="text-left rounded-2xl border border-slate-200 bg-white hover:bg-slate-50 p-3 shadow-sm transition"
+                      type="button"
+                      onClick={() => handleAgentQuestionClick(q)}
+                      aria-pressed={activeAgentQuestion === q}
+                      className={`text-left rounded-2xl border p-3 shadow-sm transition ${
+                        activeAgentQuestion === q
+                          ? "border-slate-900 ring-2 ring-slate-900/10 bg-white"
+                          : "border-slate-200 bg-white hover:bg-slate-50"
+                      }`}
                     >
                       <div className="flex items-start gap-3">
                         <div className="h-8 w-8 rounded-xl bg-slate-900/5 grid place-items-center mt-0.5">
@@ -1607,6 +1682,20 @@ export default function StockIntelAgentUI() {
                       </div>
                     </button>
                   ))}
+                </div>
+                <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Mapped output</p>
+                  {agentBusy ? (
+                    <p className="text-sm text-slate-600 mt-2">Generating response from current signals...</p>
+                  ) : agentError ? (
+                    <p className="text-sm text-amber-700 mt-2">{agentError}</p>
+                  ) : agentResponse ? (
+                    <p className="text-sm text-slate-700 mt-2">{agentResponse}</p>
+                  ) : (
+                    <p className="text-sm text-slate-600 mt-2">
+                      Click any question card to generate a mapped response for {current.ticker}.
+                    </p>
+                  )}
                 </div>
               </CardContent>
             </Card>
